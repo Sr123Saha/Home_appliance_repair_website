@@ -1,0 +1,897 @@
+import os
+import io
+import sqlite3
+from datetime import datetime
+from flask import Flask, render_template, request, redirect, url_for, session, send_file, abort, flash
+import qrcode
+
+# =====================
+# Конфиг
+# =====================
+
+DB_NAME = "home_service.db"
+FEEDBACK_FORM_URL = "https://docs.google.com/forms/d/e/1FAIpQLSdhZcExx6LSIXxk0ub55mSu-WIh23WYdGG9HY5EZhLDo7P8eA/viewform?usp=sf_link"
+
+
+# =====================
+# Подключение БД
+# =====================
+
+def get_connection():
+    """Получить соединение с БД"""
+    if not os.path.exists(DB_NAME):
+        raise FileNotFoundError(f"База данных '{DB_NAME}' не найдена.")
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# =====================
+# Инициализация Flask
+# =====================
+
+app = Flask(__name__)
+app.secret_key = "very-secret-key-for-demo"
+
+TITLE = "Сервис ремонта климатической техники"
+
+
+# =====================
+# Декораторы
+# =====================
+
+def login_required(view_func):
+    """Проверка авторизации"""
+    def wrapper(*args, **kwargs):
+        if "user" not in session:
+            return redirect(url_for("login"))
+        return view_func(*args, **kwargs)
+    wrapper.__name__ = view_func.__name__
+    return wrapper
+
+
+def manager_required(view_func):
+    """Проверка прав менеджера"""
+    def wrapper(*args, **kwargs):
+        if "user" not in session:
+            return redirect(url_for("login"))
+        user = session.get("user", {})
+        if user.get("user_type") not in ["Менеджер", "Администратор"]:
+            flash("Доступ запрещён. Требуются права менеджера.", "danger")
+            return redirect(url_for("requests_list"))
+        return view_func(*args, **kwargs)
+    wrapper.__name__ = view_func.__name__
+    return wrapper
+
+
+def admin_required(view_func):
+    """Проверка прав администратора"""
+    def wrapper(*args, **kwargs):
+        if "user" not in session:
+            return redirect(url_for("login"))
+        user = session.get("user", {})
+        if user.get("user_type") != "Администратор":
+            flash("Доступ запрещён. Требуются права администратора.", "danger")
+            return redirect(url_for("requests_list"))
+        return view_func(*args, **kwargs)
+    wrapper.__name__ = view_func.__name__
+    return wrapper
+
+
+def can_edit_request(request_id, user):
+    """Проверить, может ли пользователь редактировать заявку"""
+    user_id = user.get("user_id")
+    user_type = user.get("user_type")
+
+    # Администраторы могут всё
+    if user_type in ["Администратор", "Менеджер"]:
+        return True, True, True
+
+    try:
+        conn = get_connection()
+        with conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT client_id, master_id FROM requests WHERE request_id = ?",
+                (request_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return False, False, False
+            client_id = row["client_id"]
+            master_id = row["master_id"]
+    except:
+        return False, False, False
+
+    # Клиент может только видеть свои заявки
+    if user_type == "Клиент":
+        if client_id == user_id:
+            return True, False, False
+        return False, False, False
+
+    # Мастер может видеть и редактировать статус
+    if user_type == "Мастер":
+        if master_id == user_id:
+            return True, True, False
+        return False, False, False
+
+    # По умолчанию
+    return False, False, False
+
+
+# =====================
+# Маршруты
+# =====================
+
+@app.route("/")
+def index():
+    """Главная страница"""
+    if "user" in session:
+        return redirect(url_for("requests_list"))
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    """Вход в систему"""
+    if request.method == "POST":
+        login_value = request.form.get("login", "").strip()
+        password = request.form.get("password", "").strip()
+
+        if not login_value or not password:
+            flash("Введите логин и пароль.", "warning")
+        else:
+            try:
+                conn = get_connection()
+            except FileNotFoundError as exc:
+                flash(str(exc), "danger")
+                return render_template("login.html", current_user=session.get("user"))
+
+            with conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT user_id, fio, user_type
+                    FROM users
+                    WHERE login = ? AND password = ?
+                    """,
+                    (login_value, password),
+                )
+                row = cur.fetchone()
+
+                if row is None:
+                    flash("Неверный логин или пароль.", "danger")
+                else:
+                    session["user"] = {
+                        "user_id": row["user_id"],
+                        "fio": row["fio"],
+                        "user_type": row["user_type"],
+                    }
+                    flash(f"Добро пожаловать, {row['fio']}!", "success")
+                    return redirect(url_for("requests_list"))
+
+    return render_template("login.html", current_user=session.get("user"))
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    """Регистрация нового клиента"""
+    if request.method == "POST":
+        fio = request.form.get("fio", "").strip()
+        phone = request.form.get("phone", "").strip()
+        login_value = request.form.get("login", "").strip()
+        password = request.form.get("password", "").strip()
+        password_confirm = request.form.get("password_confirm", "").strip()
+
+        if not fio or not login_value or not password:
+            flash("Заполните все обязательные поля.", "warning")
+        elif password != password_confirm:
+            flash("Пароли не совпадают.", "warning")
+        else:
+            try:
+                conn = get_connection()
+            except FileNotFoundError as exc:
+                flash(str(exc), "danger")
+                return redirect(url_for("register"))
+
+            with conn:
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO users (fio, phone, login, password, user_type)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (fio, phone if phone else None, login_value, password, "Клиент"),
+                    )
+                    conn.commit()
+                    flash("Регистрация успешна! Теперь вы можете войти.", "success")
+                    return redirect(url_for("login"))
+                except sqlite3.IntegrityError:
+                    flash("Пользователь с таким логином уже существует.", "danger")
+
+    return render_template("register.html", current_user=session.get("user"))
+
+
+@app.route("/logout")
+def logout():
+    """Выход из системы"""
+    session.pop("user", None)
+    flash("Вы вышли из системы.", "info")
+    return redirect(url_for("login"))
+
+
+@app.route("/requests", defaults={"user_type": None})
+@app.route("/requests/<user_type>")
+@login_required
+def requests_list(user_type=None):
+    """Список заявок"""
+    current_user = session.get("user", {})
+
+    try:
+        conn = get_connection()
+    except FileNotFoundError as exc:
+        flash(str(exc), "danger")
+        return render_template(
+            "requests_list.html",
+            current_user=current_user,
+            requests=[],
+        )
+
+    base_query = """
+        SELECT 
+            r.request_id, r.request_id AS request_number,
+            r.start_date, r.climate_tech_type, r.climate_tech_model,
+            r.problem_description, r.request_status,
+            r.master_id, u.fio AS client_fio, m.fio AS master_fio,
+            m.phone AS master_phone
+        FROM requests r
+        LEFT JOIN users u ON r.client_id = u.user_id
+        LEFT JOIN users m ON r.master_id = m.user_id
+    """
+    params = []
+
+    # Фильтрация по типу пользователя
+    if current_user.get("user_type") == "Клиент":
+        base_query += " WHERE r.client_id = ?"
+        params.append(current_user.get("user_id"))
+
+    base_query += " ORDER BY r.start_date DESC, r.request_id DESC"
+
+    with conn:
+        cur = conn.cursor()
+        cur.execute(base_query, params)
+        rows = cur.fetchall()
+
+    status_classes = {
+        "Новая": "bg-secondary",
+        "В работе": "bg-warning text-dark",
+        "Ожидание запчастей": "bg-warning text-dark",
+        "Готова": "bg-primary",
+        "Завершена": "bg-success",
+        "Отменена": "bg-danger",
+    }
+
+    requests_list = []
+    for r in rows:
+        can_edit, can_status, can_all = can_edit_request(r["request_id"], current_user)
+        requests_list.append({
+            "request_id": r["request_id"],
+            "request_number": r["request_number"],
+            "start_date": r["start_date"],
+            "climate_tech_type": r["climate_tech_type"],
+            "climate_tech_model": r["climate_tech_model"],
+            "problem_description": r["problem_description"],
+            "client_fio": r["client_fio"],
+            "request_status": r["request_status"],
+            "master_fio": r["master_fio"],
+            "master_phone": r["master_phone"],
+            "status_class": status_classes.get(r["request_status"], "bg-info"),
+            "can_edit": can_edit,
+        })
+
+    return render_template(
+        "requests_list.html",
+        current_user=current_user,
+        requests=requests_list,
+    )
+
+
+@app.route("/requests/new", methods=["GET", "POST"])
+@login_required
+def new_request():
+    """Создание новой заявки"""
+    current_user = session.get("user", {})
+
+    try:
+        conn = get_connection()
+    except FileNotFoundError as exc:
+        flash(str(exc), "danger")
+        return render_template("new_request.html", current_user=current_user, clients=[], specialists=[])
+
+    with conn:
+        cur = conn.cursor()
+
+        # Получаем список клиентов
+        if current_user.get("user_type") == "Клиент":
+            cur.execute(
+                """
+                SELECT user_id, fio FROM users
+                WHERE user_id = ? AND user_type = ? AND is_active = 1
+                """,
+                (current_user.get("user_id"), "Клиент"),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT user_id, fio FROM users
+                WHERE user_type = ? AND is_active = 1
+                ORDER BY fio
+                """,
+                ("Клиент",),
+            )
+        clients = cur.fetchall()
+
+        if request.method == "POST":
+            # Определяем клиента
+            if current_user.get("user_type") == "Клиент":
+                client_id = str(current_user.get("user_id"))
+            else:
+                client_id = request.form.get("client_id", "").strip()
+
+            start_date = request.form.get("start_date", "").strip()
+            climate_type = request.form.get("climate_tech_type", "").strip()
+            climate_model = request.form.get("climate_tech_model", "").strip()
+            problem = request.form.get("problem_description", "").strip()
+            master_id = request.form.get("master_id", "").strip() or None
+
+            if not client_id or not start_date or not climate_type or not climate_model or not problem:
+                flash("Заполните все обязательные поля.", "warning")
+            else:
+                try:
+                    datetime.strptime(start_date, "%Y-%m-%d")
+                except ValueError:
+                    flash("Неверный формат даты (YYYY-MM-DD).", "warning")
+                else:
+                    with conn:
+                        cur = conn.cursor()
+                        cur.execute(
+                            """
+                            INSERT INTO requests
+                                (start_date, climate_tech_type, climate_tech_model,
+                                 problem_description, request_status, client_id, master_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (start_date, climate_type, climate_model, problem, "Новая", client_id, master_id),
+                        )
+                        request_id = cur.lastrowid
+                        cur.execute("SELECT request_id FROM requests WHERE request_id = ?", (request_id,))
+                        row = cur.fetchone()
+                        flash(
+                            f"Заявка создана! ID: {request_id}, Номер: {row['request_id']}",
+                            "success",
+                        )
+                        return redirect(url_for("requests_list", created=True))
+
+        # Получаем список специалистов
+        cur.execute(
+            """
+            SELECT user_id, fio, phone FROM users
+            WHERE user_type = ? AND is_active = 1
+            ORDER BY fio
+            """,
+            ("Мастер",),
+        )
+        specialists = cur.fetchall()
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    return render_template(
+        "new_request.html",
+        current_user=current_user,
+        clients=clients,
+        specialists=specialists,
+        today=today,
+    )
+
+
+@app.route("/clients/new", methods=["GET", "POST"])
+@login_required
+def new_client():
+    """Создание нового клиента (только для менеджера)"""
+    current = session.get("user", {})
+
+    if not current or current.get("user_type") != "Менеджер":
+        flash("Доступ запрещён.", "danger")
+        return redirect(url_for("index"))
+
+    if request.method == "POST":
+        fio = request.form.get("fio", "").strip()
+        phone = request.form.get("phone", "").strip()
+        login_value = request.form.get("login", "").strip()
+        password = request.form.get("password", "").strip()
+
+        if not fio or not phone or not login_value or not password:
+            flash("Заполните все поля.", "warning")
+        else:
+            try:
+                conn = get_connection()
+            except FileNotFoundError as exc:
+                flash(str(exc), "danger")
+                return redirect(url_for("requests_list"))
+
+            with conn:
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO users (fio, phone, login, password, user_type)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (fio, phone, login_value, password, "Клиент"),
+                    )
+                    conn.commit()
+                    flash("Клиент создан успешно.", "success")
+                    return redirect(url_for("new_request"))
+                except sqlite3.IntegrityError:
+                    flash("Пользователь с таким логином уже существует.", "danger")
+
+    return render_template("new_client.html", current_user=session.get("user"))
+
+
+@app.route("/requests/<int:request_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_request(request_id):
+    """Редактирование заявки"""
+    try:
+        conn = get_connection()
+    except FileNotFoundError as exc:
+        flash(str(exc), "danger")
+        return redirect(url_for("requests_list"))
+
+    current_user = session.get("user", {})
+    can_edit, can_status, can_all = can_edit_request(request_id, current_user)
+
+    if not can_edit:
+        flash("У вас нет прав на редактирование этой заявки.", "danger")
+        return redirect(url_for("requests_list"))
+
+    with conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                r.request_id, r.request_id AS request_number,
+                r.start_date, r.climate_tech_type, r.climate_tech_model,
+                r.problem_description, r.request_status, r.completion_date,
+                r.master_id, r.client_id, u.fio AS client_fio,
+                m.fio AS master_fio, m.phone AS master_phone
+            FROM requests r
+            LEFT JOIN users u ON r.client_id = u.user_id
+            LEFT JOIN users m ON r.master_id = m.user_id
+            WHERE r.request_id = ?
+            """,
+            (request_id,),
+        )
+        request_data = cur.fetchone()
+
+        if not request_data:
+            flash("Заявка не найдена.", "danger")
+            return redirect(url_for("requests_list"))
+
+        # Получаем список специалистов
+        cur.execute(
+            """
+            SELECT user_id, fio, phone FROM users
+            WHERE user_type = ? AND is_active = 1
+            ORDER BY fio
+            """,
+            ("Мастер",),
+        )
+        specialists = cur.fetchall()
+
+        # Получаем список клиентов (если admin/manager)
+        cur.execute(
+            """
+            SELECT user_id, fio FROM users
+            WHERE user_type = ? AND is_active = 1
+            ORDER BY fio
+            """,
+            ("Клиент",),
+        )
+        clients = cur.fetchall() if can_all else []
+
+        if request.method == "POST":
+            start_date = request.form.get("start_date", "").strip()
+            climate_type = request.form.get("climate_tech_type", "").strip()
+            climate_model = request.form.get("climate_tech_model", "").strip()
+            problem = request.form.get("problem_description", "").strip()
+            status = request.form.get("request_status", "").strip()
+            completion_date = request.form.get("completion_date", "").strip() or None
+            master_id = request.form.get("master_id", "").strip() or None
+            client_id = request.form.get("client_id", "").strip() if can_all else None
+
+            if not start_date or not climate_type or not climate_model or not problem:
+                flash("Заполните обязательные поля.", "warning")
+            else:
+                try:
+                    datetime.strptime(start_date, "%Y-%m-%d")
+                    if completion_date:
+                        datetime.strptime(completion_date, "%Y-%m-%d")
+                except ValueError:
+                    flash("Неверный формат даты (YYYY-MM-DD).", "warning")
+                else:
+                    with conn:
+                        cur = conn.cursor()
+
+                        if can_all:
+                            cur.execute(
+                                """
+                                UPDATE requests SET
+                                    start_date = ?,
+                                    climate_tech_type = ?,
+                                    climate_tech_model = ?,
+                                    problem_description = ?,
+                                    request_status = ?,
+                                    completion_date = ?,
+                                    master_id = ?,
+                                    client_id = ?
+                                WHERE request_id = ?
+                                """,
+                                (
+                                    start_date,
+                                    climate_type,
+                                    climate_model,
+                                    problem,
+                                    status,
+                                    completion_date,
+                                    master_id,
+                                    client_id or request_data["client_id"],
+                                    request_id,
+                                ),
+                            )
+                        elif can_status:
+                            cur.execute(
+                                """
+                                UPDATE requests SET
+                                    start_date = ?,
+                                    climate_tech_type = ?,
+                                    climate_tech_model = ?,
+                                    problem_description = ?,
+                                    request_status = ?,
+                                    completion_date = ?,
+                                    master_id = ?
+                                WHERE request_id = ?
+                                """,
+                                (
+                                    start_date,
+                                    climate_type,
+                                    climate_model,
+                                    problem,
+                                    status,
+                                    completion_date,
+                                    master_id,
+                                    request_id,
+                                ),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                UPDATE requests SET
+                                    start_date = ?,
+                                    problem_description = ?
+                                WHERE request_id = ?
+                                """,
+                                (start_date, problem, request_id),
+                            )
+
+                        flash("Заявка обновлена.", "success")
+                        return redirect(url_for("requests_list", edited=True))
+
+    statuses = ["Новая", "В работе", "Ожидание запчастей", "Готова", "Завершена", "Отменена"]
+    return render_template(
+        "edit_request.html",
+        current_user=current_user,
+        request_data=request_data,
+        specialists=specialists,
+        clients=clients if can_all else [],
+        statuses=statuses,
+        can_all=can_all,
+        can_status=can_status,
+    )
+
+
+# @app.route("/stats")
+# @login_required
+# def stats():
+#     """Статистика"""
+#     try:
+#         conn = get_connection()
+#     except FileNotFoundError as exc:
+#         flash(str(exc), "danger")
+#         return render_template(
+#             "stats.html",
+#             current_user=session.get("user"),
+#             finished_count=0,
+#             avg_days_str=None,
+#             type_rows=[],
+#         )
+
+#     with conn:
+#         cur = conn.cursor()
+
+#         # Количество завершённых заявок
+#         cur.execute(
+#             "SELECT COUNT(*) AS cnt FROM requests WHERE request_status = ?",
+#             ("Завершена",),
+#         )
+#         finished_count = cur.fetchone()["cnt"]
+
+#         # Среднее количество дней до выполнения
+#         cur.execute(
+#             """
+#             SELECT AVG(JULIAN(completion_date) - JULIAN(start_date)) AS avg_days
+#             FROM requests
+#             WHERE request_status = ? AND completion_date IS NOT NULL
+#             """,
+#             ("Завершена",),
+#         )
+#         avg_row = cur.fetchone()
+#         avg_days = avg_row["avg_days"]
+
+#         # Статистика по типам
+#         cur.execute(
+#             """
+#             SELECT climate_tech_type, COUNT(*) AS cnt
+#             FROM requests
+#             GROUP BY climate_tech_type
+#             ORDER BY cnt DESC
+#             """,
+#         )
+#         type_rows = cur.fetchall()
+
+#     avg_days_str = f"{avg_days:.2f}" if avg_days is not None else None
+
+#     return render_template(
+#         "stats.html",
+#         current_user=session.get("user"),
+#         finished_count=finished_count,
+#         avg_days_str=avg_days_str,
+#         type_rows=type_rows,
+#     )
+
+@app.route("/stats")
+@login_required
+def stats():
+    """Статистика"""
+    try:
+        conn = get_connection()
+    except FileNotFoundError as exc:
+        flash(str(exc), "danger")
+        return render_template(
+            "stats.html",
+            current_user=session.get("user"),
+            finished_count=0,
+            avg_days_str=None,
+            type_rows=[],
+        )
+
+    with conn:
+        cur = conn.cursor()
+
+        # Количество завершённых заявок
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM requests WHERE request_status = ?",
+            ("Завершена",),
+        )
+        finished_count = cur.fetchone()["cnt"]
+
+        # Среднее количество дней до выполнения
+        # ИСПРАВЛЕНО: используем julianday() вместо JULIAN()
+        cur.execute(
+            """
+            SELECT AVG(julianday(completion_date) - julianday(start_date)) AS avg_days
+            FROM requests
+            WHERE request_status = ? AND completion_date IS NOT NULL
+            """,
+            ("Завершена",),
+        )
+        avg_row = cur.fetchone()
+        avg_days = avg_row["avg_days"]
+
+        # Статистика по типам
+        cur.execute(
+            """
+            SELECT climate_tech_type, COUNT(*) AS cnt
+            FROM requests
+            GROUP BY climate_tech_type
+            ORDER BY cnt DESC
+            """,
+        )
+        type_rows = cur.fetchall()
+
+    avg_days_str = f"{avg_days:.2f}" if avg_days is not None else None
+
+    return render_template(
+        "stats.html",
+        current_user=session.get("user"),
+        finished_count=finished_count,
+        avg_days_str=avg_days_str,
+        type_rows=type_rows,
+    )
+
+
+
+@app.route("/users/manage", methods=["GET", "POST"])
+@login_required
+@manager_required
+def manage_users():
+    """Управление пользователями - для менеджера"""
+    try:
+        conn = get_connection()
+    except FileNotFoundError as exc:
+        flash(str(exc), "danger")
+        return redirect(url_for("requests_list"))
+
+    if request.method == "POST":
+        # Меняем роль и статус
+        user_id = request.form.get("user_id", "").strip()
+        new_role = request.form.get("user_type", "").strip()
+        is_active = request.form.get("is_active", "").strip()
+
+        if not user_id or not new_role:
+            flash("Ошибка: не указаны данные.", "danger")
+        else:
+            try:
+                with conn:
+                    cur = conn.cursor()
+                    # Обновляем роль и статус
+                    is_active_value = 1 if is_active == "1" else 0
+                    cur.execute(
+                        """
+                        UPDATE users
+                        SET user_type = ?, is_active = ?
+                        WHERE user_id = ?
+                        """,
+                        (new_role, is_active_value, user_id),
+                    )
+                    conn.commit()
+
+                    # Получаем имя пользователя для сообщения
+                    cur.execute(
+                        "SELECT fio FROM users WHERE user_id = ?",
+                        (user_id,),
+                    )
+                    user = cur.fetchone()
+                    if user:
+                        flash(
+                            f"Роль пользователя '{user['fio']}' изменена на '{new_role}'.",
+                            "success",
+                        )
+                    else:
+                        flash("Роль изменена.", "success")
+            except Exception as e:
+                flash(f"Ошибка: {str(e)}", "danger")
+
+    # Получаем список всех пользователей
+    with conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT user_id, fio, phone, login, user_type, registration_date, is_active
+            FROM users
+            ORDER BY user_type, fio
+            """,
+        )
+        users = cur.fetchall()
+
+    return render_template("manage_users.html", current_user=session.get("user"), users=users)
+
+
+# @app.route("/qr/<int:request_id>")
+# @login_required
+# def qr_for_request(request_id):
+#     """QR-код для заявки"""
+#     try:
+#         conn = get_connection()
+#     except FileNotFoundError:
+#         abort(404)
+
+#     with conn:
+#         cur = conn.cursor()
+#         cur.execute(
+#             "SELECT request_id FROM requests WHERE request_id = ?",
+#             (request_id,),
+#         )
+#         row = cur.fetchone()
+#         if row is None:
+#             abort(404)
+
+#     # Генерируем ссылку на форму обратной связи
+#     url = f"{FEEDBACK_FORM_URL}"
+
+#     # Создаём QR-код
+#     qr = qrcode.QRCode(box_size=10, border=4)
+#     qr.add_data(url)
+#     qr.make(fit=True)
+#     img = qr.make_image(fill_color="black", back_color="white")
+
+#     buffer = io.BytesIO()
+#     img.save(buffer, format="PNG")
+#     buffer.seek(0)
+
+#     return send_file(buffer, mimetype="image/png")
+
+@app.route("/qr/<int:request_id>")
+@login_required
+def qr_for_request(request_id):
+    """QR-код для заявки"""
+    try:
+        conn = get_connection()
+    except FileNotFoundError:
+        abort(404)
+
+    with conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT request_id FROM requests WHERE request_id = ?",
+            (request_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            abort(404)
+
+    # Создаём QR-код
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(FEEDBACK_FORM_URL)
+    qr.make(fit=True)
+
+    # Создаем изображение
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    # Сохраняем в байтовый поток
+    img_io = io.BytesIO()
+    img.save(img_io, 'PNG')
+    img_io.seek(0) # Обязательно возвращаем указатель в начало
+
+    return send_file(img_io, mimetype='image/png')
+
+
+@app.route("/debug/table/<table_name>")
+@login_required
+@manager_required
+def debug_table(table_name):
+    """Просмотр таблицы БД (для отладки)"""
+    try:
+        conn = get_connection()
+        with conn:
+            cur = conn.cursor()
+            cur.execute(f"SELECT * FROM {table_name}")
+            rows = cur.fetchall()
+            columns = rows[0].keys() if rows else []
+    except Exception as e:
+        return f"Ошибка: {e}"
+
+    return render_template(
+        "debug_table.html",
+        table_name=table_name,
+        columns=columns,
+        rows=rows,
+        current_user=session.get("user"),
+    )
+
+
+# =====================
+# Запуск приложения
+# =====================
+
+if __name__ == "__main__":
+    # Убедитесь, что БД существует перед запуском
+    if not os.path.exists(DB_NAME):
+        print(f"⚠️  Файл БД '{DB_NAME}' не найден!")
+        print("   Запустите bd.py первым для создания БД и импорта данных.")
+    app.run(debug=True)
